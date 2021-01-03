@@ -19,6 +19,8 @@ from __future__ import division
 from __future__ import print_function
 
 import math
+import logging as _logging
+from io import StringIO
 
 from absl.testing import parameterized
 import numpy as np
@@ -37,6 +39,7 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import sparse_ops
 from tensorflow.python.platform import test
 from tensorflow.python.util import nest
+from tensorflow.python.platform import tf_logging as logging
 
 
 class DummyArrayLike(object):
@@ -973,9 +976,8 @@ class DataHandlerTest(keras_parameterized.TestCase):
                                      [([0],), ([1],), ([2],)]])
 
   def test_list_of_scalars(self):
-    data_handler = data_adapter.DataHandler([[0], [1], [2]],
-                                            epochs=2,
-                                            steps_per_epoch=3)
+    data_handler = data_adapter.DataHandler(
+      [[0], [1], [2]], epochs=2, steps_per_epoch=3)
     returned_data = []
     for _, iterator in data_handler.enumerate_epochs():
       epoch_data = []
@@ -983,10 +985,145 @@ class DataHandlerTest(keras_parameterized.TestCase):
         epoch_data.append(next(iterator))
       returned_data.append(epoch_data)
     returned_data = self.evaluate(returned_data)
-    self.assertEqual(returned_data, [[([0],), ([1],),
-                                      ([2],)], [([0],), ([1],), ([2],)]])
+    self.assertEqual(
+      returned_data,
+      [ [([0],), ([1],), ([2],)], [([0],), ([1],), ([2],)] ])
+
+  def assert_data_handler_operation(self, handler, num_steps=None):
+    """Extract the data from a data handler
+
+    Returns tuple of:
+        xs: list of batches per epoch within a list of epochs for x data
+        ys: list of batches per epoch within a list of epochs for y data
+        sw: list of batches per epoch within a list of epochs for 
+          calculated sample weights
+    """
+    self.assertFalse(handler._adapter.should_recreate_iterator())
+    if num_steps is not None:
+        self.assertEqual(handler.inferred_steps, num_steps)
+
+    returned_xs, returned_ys, returned_sw = [], [], []
+    for _, epoch_iterator in handler.enumerate_epochs():
+      xs_epoch_data, ys_epoch_data, sw_epoch_data = [], [], []
+      for _ in handler.steps():
+        x_batch, y_batch, sw_batch = next(epoch_iterator)
+        xs_epoch_data.append(x_batch.numpy())
+        ys_epoch_data.append(y_batch.numpy())
+        sw_epoch_data.append(sw_batch.numpy())
+      returned_xs.append(xs_epoch_data)
+      returned_ys.append(ys_epoch_data)
+      returned_sw.append(sw_epoch_data)
+    return returned_xs, returned_ys, returned_sw
+
+  @parameterized.named_parameters(
+    ('rank_1_class_dense', 'class', 'dense'),
+    ('rank_1_sample_dense', 'sample', 'dense'),
+    ('rank_1_combine_dense', 'combine', 'dense'),
+    ('rank_2_class_unsqueezed', 'class', 'unsqueezed_dense'),
+    ('rank_2_sample_unsqueezed', 'sample', 'unsqueezed_dense'),
+    ('rank_2_combine_unsqueezed', 'combine', 'unsqueezed_dense'),
+    ('rank_2_class_one_hot', 'class', 'one_hot'),
+    ('rank_2_sample_one_hot', 'sample', 'one_hot'),
+    ('rank_2_combine_one_hot', 'combine', 'one_hot'),
+  )
+  def test_class_weight_single_dim_label(self, config, label_mode):
+    xs = np.ones((10, 10))
+    ys = np.array([0, 2] + [1] * 8)
+
+    if label_mode == 'unsqueezed_dense':
+      ys = np.expand_dims(ys, axis=-1)
+    elif label_mode == 'one_hot':
+      ys = np.eye(3)[ys]
+
+    sw = np.array([0.5, 1., 2.] + [1.] * 7)
+    cw = {0: 0.5, 1: 1., 2: 1.5}
+
+    data_handler = data_adapter.DataHandler(
+      x=xs, y=ys, epochs=1, batch_size=5,
+      sample_weight=sw if config in ('sample', 'combine') else None,
+      class_weight=cw if config in ('class, combine') else None)
+
+    returned_x, returned_y, returned_sw = self.assert_data_handler_operation(
+      data_handler, num_steps=2)
+
+    if label_mode == 'unsqueezed_dense':
+      ys_to_take = np.squeeze(ys)[:5]
+    elif label_mode == 'one_hot':
+      ys_to_take = np.argmax(ys, axis=-1)[:5]
+    else:
+      ys_to_take = ys[:5]
+
+    class_weighted = np.take(list(cw.values()), ys_to_take)
+
+    if config == 'class':
+      sw_batch_0 = class_weighted
+    elif config == 'sample':
+      sw_batch_0 = sw[:5]
+    elif config == 'combine':
+      assert class_weighted.shape == sw[:5].shape
+      sw_batch_0 = class_weighted * sw[:5]
+
+    assert np.all(returned_x[0][0] == xs[:5, :])
+    assert np.all(returned_y[0][0] == ys[:5])
+    assert np.all(np.squeeze(returned_sw[0][0]) == sw_batch_0)
+
+  @parameterized.named_parameters(
+    ('dense_class', 'class', False),
+    ('dense_sample', 'sample', False),
+    ('dense_combine', 'combine', False),
+    ('one_hot_class', 'class', True),
+    ('one_hot_sample', 'sample', True),
+    ('one_hot_combine', 'combine', True)
+  )
+  def test_class_weight_multi_dim(self, config, one_hot):
+    xs = np.ones((10, 8, 5))  # e.g. 10 8-by-5 greyscale images
+    ys = np.ones((10, 8, 5), dtype=int)
+    ys[0, 0, 0] = 0
+    ys[0, 1, 0] = 2
+
+    if one_hot:
+      ys = np.eye(3)[ys]
+    else:
+      # Must be shape (..., 1)
+      ys = np.expand_dims(ys, axis=-1)
+
+    cw = {0: 0.5, 1: 1., 2: 1.5}
+    sw = np.ones((10, 8, 5))
+    sw[0, 1, 0] = 0.75
+    sw[0, 0, 1] = 2.5
+
+    data_handler = data_adapter.DataHandler(
+      x=xs, y=ys, epochs=1, batch_size=5,
+      class_weight=cw if config in ('class', 'combine') else None,
+      sample_weight=sw if config in ('sample', 'combine') else None,
+      class_weight_mode="multi_dim"
+        if config in ('class', 'combine') else None,
+    )
+
+    returned_x, returned_y, returned_sw = self.assert_data_handler_operation(
+      data_handler, num_steps=2)
+
+    if one_hot:
+      ys_to_take = np.argmax(ys, axis=-1)[:5]
+    else:
+      ys_to_take = np.squeeze(ys)[:5]
+
+    class_weighted = np.take(list(cw.values()), ys_to_take)
+
+    if config == 'sample':
+      sw_batch_0 = sw[:5]
+    elif config == 'class':
+      sw_batch_0 = class_weighted
+    elif config == 'combine':
+      assert class_weighted.shape == sw[:5].shape
+      sw_batch_0 = class_weighted * sw[:5]
+
+    assert np.all(returned_x[0][0] == xs[:5, :])
+    assert np.all(returned_y[0][0] == ys[:5])
+    assert np.all(np.squeeze(returned_sw[0][0]) == sw_batch_0)
 
   def test_class_weight_user_errors(self):
+    # Class weight missing a key
     with self.assertRaisesRegex(ValueError, 'to be a dict with keys'):
       data_adapter.DataHandler(
           x=[[0], [1], [2]],
@@ -999,16 +1136,51 @@ class DataHandlerTest(keras_parameterized.TestCase):
               3: 1.5  # Skips class `2`.
           })
 
+    # Model has multiple outputs
     with self.assertRaisesRegex(ValueError, 'with a single output'):
       data_adapter.DataHandler(
           x=np.ones((10, 1)),
-          y=[np.ones((10, 1)), np.zeros((10, 1))],
+          y=[np.ones((10, 1)), np.zeros((10, 2))],
           batch_size=2,
           class_weight={
               0: 0.5,
               1: 1.,
               2: 1.5
           })
+
+    # 3+ dim label attempted without selecting multi_dim
+    with self.assertRaisesRegex(ValueError, 'selecting `class_weight_mode'):
+      data_adapter.DataHandler(
+        x=np.ones((10, 1)),
+        y=np.ones((10, 5, 1)),
+        batch_size=2,
+        class_weight={
+          0: 0.5,
+          1: 1.,
+          2: 1.5
+        })
+
+    # Dense label attempted with multi_dim class weights
+    with self.assertRaisesRegex(ValueError, 'to be 1 for dense labels, or'):
+      data_adapter.DataHandler(
+        x=np.ones((10, 5, 5)),
+        y=np.ones((10, 5, 5)),
+        batch_size=2,
+        class_weight={
+          0: 0.5,
+          1: 1.,
+          2: 1.5},
+        class_weight_mode="multi_dim"
+      )
+
+    # array attempted for class weights
+    with self.assertRaisesRegex(ValueError, 'must be dict'):
+      data_adapter.DataHandler(
+        x=np.ones((10, 1)),
+        y=np.ones((10,)),
+        batch_size=2,
+        class_weight=np.array([0.5, 1.])
+      )
 
   @parameterized.named_parameters(('numpy', True), ('dataset', False))
   def test_single_x_input_no_tuple_wrapping(self, use_numpy):

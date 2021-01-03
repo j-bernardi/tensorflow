@@ -489,6 +489,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
               loss=None,
               metrics=None,
               loss_weights=None,
+              class_weight_mode=None,
               weighted_metrics=None,
               run_eagerly=None,
               steps_per_execution=None,
@@ -537,6 +538,12 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             If a list, it is expected to have a 1:1 mapping to the model's
               outputs. If a dict, it is expected to map output names (strings)
               to scalar coefficients.
+        class_weight_mode: if `class_weight_mode="muti_dim"`, enables use
+          of class_weight in `model.fit()` for 3+ dimensional target data.
+          Target data must either be 1) a one-hot encoded label tensor e.g.
+          shape (label_shape, n_classes), or be in dense format with an 
+          expanded final dimension, e.g. shape (label_shape, 1). Dense
+          labels of shape (label_shape) are ambiguous, and are invalid.
         weighted_metrics: List of metrics to be evaluated and weighted by
           sample_weight or class_weight during training and testing.
         run_eagerly: Bool. Defaults to `False`. If `True`, this `Model`'s
@@ -580,6 +587,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
       self.optimizer = self._get_optimizer(optimizer)
       self.compiled_loss = compile_utils.LossesContainer(
           loss, loss_weights, output_names=self.output_names)
+      self._class_weight_mode = class_weight_mode
       self.compiled_metrics = compile_utils.MetricsContainer(
           metrics, weighted_metrics, output_names=self.output_names,
           from_serialized=from_serialized)
@@ -1114,6 +1122,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
           epochs=epochs,
           shuffle=shuffle,
           class_weight=class_weight,
+          class_weight_mode=self._class_weight_mode,
           max_queue_size=max_queue_size,
           workers=workers,
           use_multiprocessing=use_multiprocessing,
@@ -1785,9 +1794,13 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
     _disallow_inside_tf_function('train_on_batch')
     with self.distribute_strategy.scope(), \
          training_utils.RespectCompiledTrainableState(self):
-      iterator = data_adapter.single_batch_iterator(self.distribute_strategy, x,
-                                                    y, sample_weight,
-                                                    class_weight)
+      iterator = data_adapter.single_batch_iterator(
+        strategy=self.distribute_strategy,
+        x=x, 
+        y=y,
+        sample_weight=sample_weight,
+        class_weight=class_weight,
+        class_weight_mode=self._class_weight_mode)
       self.train_function = self.make_train_function()
       logs = self.train_function(iterator)
 
